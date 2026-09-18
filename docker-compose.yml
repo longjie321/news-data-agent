@@ -1,0 +1,42 @@
+# ============================================================
+# 【这个文件干什么】
+#   一条命令把服务跑起来：
+#       docker compose up -d
+#
+# 【跑之前必须先设置一个环境变量（含数据库密码，不能写在这个文件里）】
+#   Windows PowerShell:
+#       $env:DOCKER_DATABASE_URL="mysql+aiomysql://root:你的MySQL密码@host.docker.internal:3306/news_agent"
+#   Git Bash / Linux / macOS:
+#       export DOCKER_DATABASE_URL="mysql+aiomysql://root:你的MySQL密码@host.docker.internal:3306/news_agent"
+#
+# 【为什么密码不直接写在这个文件里】
+#   写在这里 = 提交到 git = 全世界都能看到你的数据库密码。
+#   所以这里用 ${变量:?提示} 的写法：变量没设就直接报错提醒你，
+#   而不是悄悄用一个弱密码跑起来。
+# ============================================================
+
+services:
+  api:
+    build: .
+    container_name: news_agent_api
+
+    ports:
+      # 左边是宿主机端口，右边是容器端口
+      - "8020:8020"
+
+    # 从 .env 读模型相关的配置（LLM_API_KEY 等）
+    env_file:
+      - .env
+
+    environment:
+      # ⚠️ 容器里的 127.0.0.1 指的是"容器自己"，不是你的电脑，
+      #   所以连宿主机的 MySQL 必须写 host.docker.internal。
+      #   这一行会覆盖 .env 里的 DB_URL（environment 的优先级比 env_file 高）。
+      - DB_URL=${DOCKER_DATABASE_URL:?请先设置 DOCKER_DATABASE_URL 环境变量（含 MySQL 密码），见本文件顶部注释}
+
+    extra_hosts:
+      # 让容器内部能解析 host.docker.internal
+      # （Windows / Mac 的 Docker Desktop 自带，Linux 上需要这一行）
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
