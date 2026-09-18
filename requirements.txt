@@ -19,7 +19,7 @@ httpx==0.28.1
 
 # ---- 数据校验 + 配置读取 ----
 pydantic==2.13.5
-python-dotenv>=1.0,<2.0
+python-dotenv==1.2.3
 
 # ---- 数据库（异步 MySQL）----
 sqlalchemy[asyncio]==2.0.54
