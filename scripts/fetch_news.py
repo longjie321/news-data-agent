@@ -6,6 +6,11 @@
 #   python scripts/fetch_news.py                抓所有"已申请"的接口，每个 1 页
 #   python scripts/fetch_news.py --pages 2      每个接口抓 2 页（每页 50 条）
 #   python scripts/fetch_news.py --dry-run      只打印抓到了什么，不写数据库
+#   python scripts/fetch_news.py --replace      先清空库再灌（把测试数据换成真新闻）
+#
+#   ⚠️ 默认行为是"只新增、不删除"（按标题去重，重复的跳过）。
+#      所以如果库里已经有 seed_data.py 造的测试数据，跑完会变成"混合"状态。
+#      想彻底换成真实数据，就加 --replace。
 #
 # 【注意】
 #   ① 必须先在 .env 里配好 NEWS_API_KEY
@@ -26,7 +31,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from config.db_conf import DB_URL
@@ -162,6 +167,11 @@ async def main():
     parser = argparse.ArgumentParser(description="从天聚数行抓真实新闻进库")
     parser.add_argument("--pages", type=int, default=1, help="每个接口抓几页（每页 50 条）")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不写数据库")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="先清空 news 表再灌（把本地测试数据换成真实新闻时用）",
+    )
     args = parser.parse_args()
 
     if not NEWS_API_KEY:
@@ -216,7 +226,14 @@ async def main():
     skipped = 0
 
     async with session_factory() as session:
-        # 先把库里已有的标题查出来，用来去重
+        # 如果传了 --replace，先把老数据全删掉。
+        # ⚠️ 这一步不可恢复，所以只有显式加 --replace 才会执行 ——
+        #   兜底默认是"只新增、不删除"，避免误操作把库清空。
+        if args.replace:
+            await session.execute(delete(News))
+            print("  [--replace] 已清空原有数据（准备换成真实新闻）")
+
+        # 把库里已有的标题查出来，用来去重
         title_stmt = select(News.title)
         result = await session.execute(title_stmt)
 
