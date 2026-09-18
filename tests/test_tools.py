@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 
 from models.news import News
 from tools.definitions import (
+    MAX_LIMIT,
     compare_categories,
     count_news_by_category,
     count_news_by_time,
@@ -35,7 +36,6 @@ from tools.definitions import (
     search_news,
 )
 from tools.registry import (
-    MAX_LIMIT,
     TOOLS,
     TOOL_NAME_TO_FUNCTION,
     _limit_result_size,
