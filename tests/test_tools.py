@@ -319,6 +319,12 @@ def test_limit_result_size_trims_long_list():
     assert "note" in trimmed
     assert len(trimmed["news"]) < 200
 
+    # ★ 必须告诉模型"实际留了几条"。
+    #   只说"已截断"的话，模型看到 3 条会以为库里总共就 3 条，
+    #   答出"全文只有 3 篇"这种错误结论。
+    assert "kept" in trimmed
+    assert trimmed["kept"] == len(trimmed["news"])
+
 
 def test_limit_result_size_keeps_short_result():
     """没超长的结果不能被动 —— 一个字都不该改"""
