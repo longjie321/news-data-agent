@@ -305,13 +305,18 @@ def _limit_result_size(result: dict) -> dict:
 
             if _json_length(trimmed) <= MAX_RESULT_CHARS:
                 trimmed["truncated"] = True
-                trimmed["note"] = "结果过长已截断，只保留了前一部分"
+                # ★ 必须告诉模型"实际保留了几条"，不能只说"已截断"。
+                #   否则模型看到 3 条数据，会以为"库里总共就 3 条"，
+                #   答出"全文只有 3 篇"这种错误结论。
+                trimmed["kept"] = len(items)
+                trimmed["note"] = "结果过长已截断，只保留了前 %d 条" % len(items)
                 return trimmed
 
     # 列表砍到只剩一条还是太长（比如单条正文特别长）→ 整体只给一段预览
     return {
         "truncated": True,
-        "note": "结果过长已截断",
+        "kept": 0,
+        "note": "结果过长，只能给出开头一段预览，不是完整数据",
         "preview": json.dumps(result, ensure_ascii=False)[:MAX_RESULT_CHARS],
     }
 
