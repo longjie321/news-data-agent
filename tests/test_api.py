@@ -273,3 +273,69 @@ def test_crash_error_message_does_not_leak_internals(monkeypatch):
 
     assert "my-secret-password" not in response.text
     assert "aiomysql" not in response.text
+
+
+def test_chat_returns_500_when_no_llm_key(monkeypatch):
+    """
+    没配 key 时必须**在开流之前**拦下来（返回 500）。
+
+    为什么必须在开流前：流一旦开始发，HTTP 状态码就改不了了 ——
+    那时候只能靠 error 事件报错，状态码还是 200，监控和调用方都会误判"成功了"。
+    """
+    import routers.agent as router_module
+
+    monkeypatch.setattr(router_module, "LLM_API_KEY", "")
+
+    response = client.post("/api/agent/chat", json={"question": "你好"})
+
+    assert response.status_code == 500
+    assert "LLM_API_KEY" in response.json()["detail"]
+
+
+def test_chat_emits_error_event_when_llm_call_fails(monkeypatch):
+    """
+    上游调用失败（比如 key 无效、余额不足、接口 500）时，
+    必须发一条 error 事件，而不是让流断掉。
+
+    这里把 call_llm_once 换成"必然抛异常"的版本 —— 不真的发网络请求，所以不花钱。
+    """
+    import crud.agent as agent_module
+
+    async def failing_call(messages, force_tool=False):
+        raise RuntimeError("AI 接口错误(401)：Authentication Fails")
+
+    monkeypatch.setattr(agent_module, "call_llm_once", failing_call)
+
+    response = client.post("/api/agent/chat", json={"question": "体育类有多少篇新闻"})
+
+    assert response.status_code == 200
+    # 开场事件照发（流已经开始了）
+    assert "event: mode" in response.text
+    # 然后必须有一条 error 把失败告诉前端
+    assert "event: error" in response.text
+    assert "调用模型失败" in response.text
+    # 出错后不该再发 done（否则前端会以为"正常结束了"）
+    assert "event: done" not in response.text
+
+
+def test_chat_rejects_blank_question():
+    """
+    ★ 纯空白的问题必须被拒绝。
+
+    实测过：`min_length=1` 拦不住 " "（一个空格的长度也是 1），
+    会真的去调一次大模型 —— 白花钱、还白等好几秒。
+    （页面上有 trim 检查，但直接调接口这条路径没有，所以校验要放服务端。）
+    """
+    for blank in [" ", "   ", "  \n  "]:
+        response = client.post("/api/agent/chat", json={"question": blank})
+
+        assert response.status_code == 422, "空白输入 %r 竟然通过了" % blank
+
+
+def test_question_is_trimmed():
+    """前后空白应该被自动修剪（用 Pydantic 直接构造，不走接口、不花钱）"""
+    from schemas.agent import AgentChatRequest
+
+    obj = AgentChatRequest(question="  体育类有多少篇  ")
+
+    assert obj.question == "体育类有多少篇"
