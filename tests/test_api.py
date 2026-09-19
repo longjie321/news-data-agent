@@ -20,6 +20,7 @@
 
 from fastapi.testclient import TestClient
 
+from crud.agent import has_fabricated_count, is_small_talk, should_force_tool
 from main import app
 
 # 整个文件共用一个客户端就行
@@ -156,3 +157,60 @@ def test_openapi_has_all_endpoints():
         "/api/agent/health",
     ):
         assert expected in paths, "接口 %s 不见了！" % expected
+
+
+# ============================================================
+# Agent 的"兜底要不要强制查库"逻辑（纯函数，不调模型、不花钱）
+#
+# 这段逻辑很容易改坏、而且坏了的后果很隐蔽：
+#   强制多了 → 越界问题（问天气、问无关话题）被硬塞一次数据库查询；
+#   强制少了 → 模型偷懒不查库、直接编数字，数据类应用里这是致命的。
+# 所以两侧都要钉住。
+# ============================================================
+def test_greeting_is_small_talk():
+    assert is_small_talk("你好") is True
+    assert is_small_talk("谢谢啦") is True
+
+
+def test_data_question_is_not_small_talk():
+    """带数据意图词的问题，不能被当成寒暄"""
+    assert is_small_talk("科技类有多少篇？") is False
+
+
+def test_generic_time_word_alone_is_not_data_intent():
+    """
+    ★ 这是实测踩过的坑，必须钉住：
+      "今天天气怎么样？" 里有"今天"。原来"今天"在数据词表里，
+      于是被判成数据问题 → 模型被强行按回去查库 →
+      随机挑了个工具调，回答里还塞一段不相关的新闻统计。
+      泛时间词不该单独构成"数据意图"。
+    """
+    assert is_small_talk("今天天气怎么样？") is False
+    # 不寒暄、也不含强数据词 → 不该强制查库
+    assert should_force_tool("今天天气怎么样？", False, "天气我查不到，建议看天气 App") is False
+
+
+def test_fabricated_count_detected():
+    """没查库却报出"X 篇/X 条" → 判定为偷懒，要强制它去查"""
+    assert has_fabricated_count("根据数据库，科技类共有 51 篇。") is True
+    assert should_force_tool("那科技类有多少篇？", False, "共有 51 篇") is True
+
+
+def test_fabricated_count_not_fooled_by_tool_count():
+    """"我有 7 个工具"这种带数字但不是"篇/条"的，不能误判"""
+    assert has_fabricated_count("我有 7 个工具可以帮你查新闻。") is False
+
+
+def test_force_tool_signal_1_strong_data_word():
+    """信号①：问题里有明确数据词 → 第一轮就强制（哪怕它答得挺像样）"""
+    assert should_force_tool("库里一共有多少条新闻？", False, "稍等，我看看") is True
+
+
+def test_force_tool_skipped_for_small_talk():
+    """寒暄绝不强制"""
+    assert should_force_tool("你好", True, "你好！我是新闻数据助手") is False
+
+
+def test_plain_chat_question_not_forced():
+    """既不是寒暄、也不是查数的普通问题 → 不强制"""
+    assert should_force_tool("给我讲个笑话", False, "好的，从前有座山……") is False
