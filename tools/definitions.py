@@ -52,6 +52,29 @@ from models.news import News
 MAX_LIMIT = 20
 
 
+def _to_int(value, default: int) -> int:
+    """
+    把模型给的参数挤成整数；实在挤不动就用默认值。
+
+    ★ 为什么需要它（2026-09-19 实测补的）
+      模型的参数走的是 JSON，理论上数字就是数字。但实测有两类意外：
+        ① "limit": "5"   —— 写成字符串（有的模型就是会这样输出）
+        ② "limit": 5.7   —— 写成小数
+      原来的代码直接拿它跟 1 比大小，于是：
+        字符串 → 抛 TypeError（'<' not supported between 'str' and 'int'），
+                 虽然被 run_tool 的兜底接住了，但用户看到的是"工具参数不正确"；
+        小数   → 5.7 能通过所有判断，最后被塞进 SQL 变成 LIMIT 5.7，
+                 MySQL 语法直接报错 —— 这个更隐蔽，因为拦不住。
+      所以统一先 int() 洗一遍：
+        字符串 "5" → 5    小数 5.7 → 5（向下取整）    None / "abc" → 默认值
+      一句话记住：**模型给的脏数据，要在进数据库之前洗干净。**
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _clean_limit(limit: int) -> int:
     """
     把模型给的 limit 修正到一个合理范围内。
@@ -59,9 +82,9 @@ def _clean_limit(limit: int) -> int:
     为什么需要这个函数：
       大模型填参数并不总是靠谱，可能填 0、负数，或者直接填 10000。
       不拦一下的话，要么查出空结果，要么一次拉太多数据。
+      （类型不对的情况由 _to_int 处理）
     """
-    if limit is None:
-        return 5
+    limit = _to_int(limit, 5)
 
     if limit < 1:
         return 1
@@ -74,8 +97,7 @@ def _clean_limit(limit: int) -> int:
 
 def _clean_days(days: int) -> int:
     """把模型给的 days 修正到 1~365 天之间（跟 _clean_limit 是同一个思路）"""
-    if days is None:
-        return 7
+    days = _to_int(days, 7)
 
     if days < 1:
         return 1
@@ -84,6 +106,41 @@ def _clean_days(days: int) -> int:
         return 365
 
     return days
+
+
+def _since_datetime(days: int) -> datetime:
+    """
+    算出"最近 N 天"的起始时刻 —— 按【自然日】算，而不是"往前推 N×24 小时"。
+
+    ★ 这是一个实测发现的 bug（2026-09-19 修）
+      原来两个工具里写的都是：
+          since = datetime.now() - timedelta(days=days)
+      也就是"从现在往前数 N×24 小时"。但工具说明里明明写着
+      「1 表示今天，7 表示最近一周」—— 说的其实是**日历上的今天和这一周**。
+
+      实测证据（库里当时的数据：9/17 有 31 条、9/18 有 129 条、9/19 有 79 条）：
+          问"今天有多少条新闻"
+          → 工具的 since = 2026-09-18 12:16，返回 **206 条**
+          → 但今天（9/19）真实的条数是 **79 条**
+        多出来的 127 条，全是"昨天中午之后"混进来的。
+      也就是说：问"今天"，答案错了 1.5 倍，而且从输出上完全看不出错。
+      —— 这是最危险的一类 bug：答错了，还很自信。
+
+      改成"从 (days-1) 天前的 00:00 开始"之后：
+          days=1 → 今天 00:00 起     （就是口语里的"今天"）
+          days=7 → 6 天前 00:00 起   （含今天正好 7 个自然日，即"最近一周"）
+      这也更符合人说话的习惯 —— 大家说的"最近一周"是日历上的 7 天，
+      不是"168 小时"。所以参数名叫 days（天）而不是 hours，就该按天算。
+
+      （`get_category_trend` 返回的日期序列也是按自然日补 0 的，
+        两边口径必须一致，否则序列的第一天会是个不完整的日子。）
+    """
+    days = _clean_days(days)
+
+    # 先退到 (days-1) 天前，再把时分秒归零 —— 这样 days=1 就正好是"今天 0 点"。
+    start = datetime.now() - timedelta(days=days - 1)
+
+    return start.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _news_to_dict(row: News) -> dict:
@@ -255,8 +312,10 @@ async def count_news_by_time(
     """
     days = _clean_days(days)
 
-    # datetime.now() 是"现在"，减去 timedelta(days=N) 就得到"N 天前"
-    since = datetime.now() - timedelta(days=days)
+    # 起始时刻按【自然日】算（days=1 就是今天 0 点）—— 详见 _since_datetime 的说明。
+    # ⚠️ 别改回 datetime.now() - timedelta(days=days)：那样 days=1 会变成"过去 24 小时"，
+    #    实测问"今天有多少条"答成 206 条，而真实只有 79 条。
+    since = _since_datetime(days)
 
     stmt = (
         select(func.count())
@@ -406,7 +465,10 @@ async def get_category_trend(
       这是"工具给原料、模型做判断"的分工。
     """
     days = _clean_days(days)
-    since = datetime.now() - timedelta(days=days)
+
+    # ⚠️ 必须和 count_news_by_time 用同一个口径（自然日）。
+    #    否则序列的第一天会是个"半天"，和后面补齐的整日 0 天混在一起，趋势读不准。
+    since = _since_datetime(days)
 
     # 【新语法】func.date(News.publish_time)
     #   这是在调用 MySQL 自带的 DATE() 函数，把 "2026-09-18 10:30:00"
