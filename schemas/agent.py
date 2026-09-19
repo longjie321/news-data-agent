@@ -45,7 +45,15 @@ class AgentChatRequest(BaseModel):
     #   因为 Python 有个经典坑：可变类型（列表、字典）当默认值会被所有实例共享，
     #   一个请求往里塞了东西，别的请求也会看到。
     #   default_factory 的意思是"每次要默认值的时候，现调一次 list() 造个新的"。
+    #
+    # ⚠️ max_length=20 是后来排查时补上的 —— 原来这里【没有任何条数上限】：
+    #   实测构造 5000 条 history 会被原样放行（每条内容还能塞 4000 字），
+    #   一个请求就能把体积撑到几十 MB。后果有两个：
+    #     ① 花钱：这些内容都会进模型上下文，按 token 计费
+    #     ② 稳定性：请求体过大可能直接把内存打爆
+    #   前端本来就只保留最近 6 条，这里给 20 条已经足够宽松了。
     history: list[ChatMessage] = Field(
         default_factory=list,
-        description="历史消息，可以不传",
+        max_length=20,
+        description="历史消息，可以不传（最多 20 条）",
     )
