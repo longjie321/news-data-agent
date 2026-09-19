@@ -92,7 +92,7 @@ def clean_html(text: str) -> str:
     return text.strip()
 
 
-def parse_time(text: str) -> datetime:
+def parse_time(text: str):
     """
     把 RSS 给的时间字符串转成 datetime。
 
@@ -100,13 +100,20 @@ def parse_time(text: str) -> datetime:
         Fri, 18 Sep 2026 14:06:00 +0800     ← RFC 822 格式（最标准）
         2025-06-05                          ← 只有日期
         2026-09-18T14:06:00+08:00           ← ISO 格式
-    所以这里挨个试，都不成功就用"现在"顶上 —— 保证不会因为时间格式崩溃。
+    所以这里挨个试。
+
+    ⚠️ 全都试不成功时返回 None，**不再用"现在"顶上**。
+       这是 2026-09-19 排查时改的，原来的写法有个很隐蔽的坑：
+       解析失败 → 时间被设成"现在" → 这条新闻看起来"刚刚发布"，
+       而且它会【绕过 main() 里那道"丢掉超过 N 天旧闻"的过滤】
+       （因为时间就是当前时刻，永远算"够新"），全程还没有任何提示。
+       现在改成返回 None，由 main() 明确计数并打印警告。
 
     【用到的东西（标准库）】
       email.utils.parsedate_to_datetime —— 专门解析 RFC 822 那种 "Fri, 18 Sep ..." 格式
     """
     if not text:
-        return datetime.now()
+        return None
 
     text = text.strip()
 
@@ -145,7 +152,8 @@ def parse_time(text: str) -> datetime:
     except ValueError:
         pass
 
-    return datetime.now()
+    # 三种格式全试过还是不行 → 返回 None（具体怎么处理交给 main()）
+    return None
 
 
 def fake_views(title: str) -> int:
@@ -337,6 +345,29 @@ async def main():
         print("")
         print("可以先跑 python scripts/seed_data.py 用本地测试数据把项目跑起来。")
         return
+
+    # ---- 处理"没能解析出发布时间"的条目 ----
+    # 【为什么单独处理这一段（2026-09-19 排查补上的）】
+    #   parse_time 解析失败时会返回 None。以前是直接返回 datetime.now()，
+    #   后果很隐蔽，三件事一起发生：
+    #     ① 这些条目的时间完全是假的（看起来"刚刚发布"）
+    #     ② 它们会绕过下面那道"丢掉超过 N 天旧闻"的过滤 ——
+    #        因为时间就是当前时刻，永远算"够新"
+    #     ③ 全程零提示，你根本不知道库里有几条时间不可信
+    #   现在改成：明确计数 + 打印警告。数据照样保留（内容是真的，丢了可惜），
+    #   但"时间不可信"这件事必须让人看见。
+    time_missing = 0
+
+    for item in all_items:
+        if item["publish_time"] is None:
+            item["publish_time"] = datetime.now()
+            time_missing = time_missing + 1
+
+    if time_missing > 0:
+        print("")
+        print("  ⚠️  警告：有 %d 条没能解析出发布时间，已按「当前时间」处理。" % time_missing)
+        print("      这些条目的时间不可信，也可能被算进「最近一天」里。")
+        print("      通常说明那个源的 pubDate 格式变了，建议看一眼源。")
 
     # ---- 先丢掉太旧的新闻 ----
     # 【为什么必须做这一步（2026-09-18 排查数据质量时踩到的坑）】
