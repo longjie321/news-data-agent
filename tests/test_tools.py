@@ -22,11 +22,16 @@
 #   测试要检验的是"逻辑对不对"，不是"数据是不是恰好这么多"。
 # ============================================================
 
+from datetime import datetime
+
 from sqlalchemy import func, select
 
 from models.news import News
 from tools.definitions import (
     MAX_LIMIT,
+    _clean_days,
+    _clean_limit,
+    _since_datetime,
     compare_categories,
     count_news_by_category,
     count_news_by_time,
@@ -334,6 +339,114 @@ async def test_run_tool_wrong_arguments(db):
 
 
 # ============================================================
+# 参数清洗：模型给脏参数时不能崩，也不能把脏值送进 SQL
+#
+# 【为什么专门测这个】
+#   模型的参数走 JSON，实测会出现 "limit": "5"（字符串）和 "limit": 5.7（小数）。
+#   字符串会让原来的实现抛 TypeError；小数更危险 —— 它能通过所有判断，
+#   最后变成 SQL 的 LIMIT 5.7，MySQL 直接语法报错。
+# ============================================================
+def test_clean_limit_handles_string():
+    """模型把 limit 写成字符串 "5" 要能认出来，而不是抛异常"""
+    assert _clean_limit("5") == 5
+
+
+def test_clean_limit_handles_float():
+    """小数的 limit 要转成整数，否则会变成 SQL 里的 LIMIT 5.7"""
+    assert _clean_limit(5.7) == 5
+
+
+def test_clean_limit_rejects_garbage():
+    """彻底没法转的值要退回默认值，不能崩"""
+    assert _clean_limit(None) == 5
+    assert _clean_limit("abc") == 5
+
+
+def test_clean_limit_clamps_range():
+    """越界的值要夹到 1 ~ MAX_LIMIT"""
+    assert _clean_limit(0) == 1
+    assert _clean_limit(-3) == 1
+    assert _clean_limit(10000) == MAX_LIMIT
+
+
+def test_clean_days_handles_dirty_input():
+    """days 也是同一套清洗逻辑"""
+    assert _clean_days("7") == 7
+    assert _clean_days(7.9) == 7
+    assert _clean_days(None) == 7
+    assert _clean_days("abc") == 7
+
+
+def test_clean_days_clamps_range():
+    """days 的范围是 1 ~ 365"""
+    assert _clean_days(0) == 1
+    assert _clean_days(-1) == 1
+    assert _clean_days(999) == 365
+
+
+# ============================================================
+# "最近 N 天"要按【自然日】算，不是"往前推 N×24 小时"
+#
+# 【为什么专门测这个】
+#   工具说明里写着「1 表示今天」，但原来实现是 now - timedelta(days=days)，
+#   也就是"过去 24 小时"。实测问"今天有多少条"：工具答 206 条、
+#   而今天真实只有 79 条 —— 把昨天中午之后的 127 条也算进来了。
+#   答错了而且从输出上看不出来，这是最危险的一类 bug。
+# ============================================================
+def test_since_datetime_days_1_is_today_midnight():
+    """days=1 必须落在"今天 00:00"，这样才等于口语里的"今天" """
+    since = _since_datetime(1)
+    today = datetime.now().date()
+
+    assert since.date() == today, "days=1 应该是今天"
+    assert (since.hour, since.minute, since.second, since.microsecond) == (0, 0, 0, 0), (
+        "必须是 0 点整，否则会把昨天某个时刻之后的数据也算进'今天'"
+    )
+
+
+def test_since_datetime_days_7_covers_7_calendar_days():
+    """days=7 应该是"含今天在内正好 7 个自然日\""""
+    since = _since_datetime(7)
+    today = datetime.now().date()
+
+    assert (today - since.date()).days == 6, "应该是 6 天前的 0 点（含今天共 7 天）"
+    assert since.hour == 0 and since.minute == 0
+
+
+async def test_count_news_by_time_matches_calendar_day(db):
+    """
+    ★ days=1 的统计结果，必须等于"从今天 00:00 起"的真实条数。
+
+    这条是给上面那个"答错 1.5 倍"的 bug 上的保险：
+    以后谁把 _since_datetime 改回 timedelta 的写法，这里会立刻红。
+    """
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    expected = await db.scalar(
+        select(func.count()).select_from(News).where(News.publish_time >= midnight)
+    )
+
+    result = await count_news_by_time(db, days=1)
+
+    assert result["count"] == expected, (
+        "days=1 统计到的条数应该和'今天 0 点起'完全一致（%s vs %s）"
+        % (result["count"], expected)
+    )
+
+
+async def test_category_trend_series_starts_at_midnight(db):
+    """
+    趋势序列的第一天必须和 count_news_by_time 用同一个起点。
+
+    否则序列第一天是个"半天"，和后面补出来的整日 0 混在一起，趋势会读歪。
+    """
+    result = await get_category_trend(db, days=7)
+
+    assert len(result["series"]) == 7
+    assert result["series"][0]["date"] == _since_datetime(7).strftime("%Y-%m-%d")
+    assert result["series"][-1]["date"] == datetime.now().strftime("%Y-%m-%d")
+
+
+# ============================================================
 # 结果长度保护（防止多轮累积撑爆上下文）
 # ============================================================
 def test_limit_result_size_trims_long_list():
@@ -361,3 +474,110 @@ def test_limit_result_size_keeps_short_result():
 
     assert result == small
     assert "truncated" not in result
+
+
+def test_limit_result_size_keeps_head_for_news_list():
+    """
+    新闻列表被截断时保留【头部】。
+
+    因为它按发布时间倒序排（最新的在前），保留前几条才是"最新的新闻"。
+    """
+    big = {"news": [{"id": i, "title": "很长的标题" * 20} for i in range(200)]}
+
+    trimmed = _limit_result_size(big)
+
+    assert trimmed.get("truncated") is True
+    assert len(trimmed["news"]) < 200
+    # 第一项还是原来第一项（最新那篇）
+    assert trimmed["news"][0] == big["news"][0]
+
+
+def test_limit_result_size_keeps_tail_for_time_series():
+    """
+    时间序列被截断时必须保留【尾部】—— 这是一个真实踩过的坑。
+
+    问"最近一年发文走势"时，get_category_trend 会返回 365 天，
+    长度超标被砍半。原来的实现保留前半段（最早的日子），
+    于是【最近几个月的数据直接消失】，模型据此判趋势会完全反过来，
+    而且它自己不知道。
+
+    series 是按日期正序排的（最早在前），所以最新数据在尾部。
+    """
+    days = 400
+    big = {
+        "category": "全部",
+        "days": days,
+        "series": [{"date": "2026-01-01", "count": i} for i in range(days)],
+    }
+
+    trimmed = _limit_result_size(big)
+
+    assert trimmed.get("truncated") is True
+    assert len(trimmed["series"]) < days
+    # ★ 最后一项必须还是最新那一天（尾部被保留）
+    assert trimmed["series"][-1] == big["series"][-1]
+    # ★ 而第一项已经不是最早那天了（头部被丢掉）
+    assert trimmed["series"][0] != big["series"][0]
+    # note 要说清"保留的是最近若干天"，而不是含糊的"前 N 条"
+    assert "最近" in trimmed["note"]
+
+
+# ============================================================
+# 代码卫生：分类清单只能有一份定义（2026-09-19 优化时加的）
+#
+# 背景：这串分类名原来在 tools/registry.py 里硬编码了两遍
+#   （给模型看的"可选值"），scripts/seed_data.py 里还有一份。
+#   以后想加一个分类，得记住把所有地方都改掉 ——
+#   漏了工具描述那一处，模型看到的"可选值"就是旧的，
+#   它会不敢用新分类（或者用了、参数却对不上）。
+#   现在统一从 config/news_conf.py 的 CATEGORIES 取。
+#   下面两条把这件事钉住。
+# ============================================================
+def test_registry_descriptions_contain_full_category_list():
+    """
+    工具描述里必须真的**带着完整的分类清单**（至少 3 处）。
+
+    ⚠️ 这条测试的局限要说清楚（实测发现）：
+       它只能验证"描述里有正确的清单"，**区分不出**下面这两种写法 ——
+         ① f"{CATEGORY_LIST_TEXT}"     ← 从常量拼的（我们想要的）
+         ② "体育、科技、财经、娱乐、社会、国内、国际、头条"  ← 硬编码，但字面一样
+       因为字符串内容相同，`in` 判断两种情况都成立。
+       真正防硬编码的是下面那条 `test_registry_does_not_hardcode_category_list`
+       （它直接读源码找那串字）。
+       两条的分工：这条防"清单被人删掉"（删了模型就不知道可选值），
+       下面那条防"清单被人写死"。
+    """
+    from config.news_conf import CATEGORY_LIST_TEXT
+    from tools.registry import TOOLS
+
+    found = 0
+
+    for item in TOOLS:
+        function = item.get("function") or {}
+        parameters = function.get("parameters") or {}
+        properties = parameters.get("properties") or {}
+
+        for param_info in properties.values():
+            description = param_info.get("description") or ""
+            if CATEGORY_LIST_TEXT in description:
+                found = found + 1
+
+    assert found >= 3, "工具描述里应该有 3 处以上引用分类清单，实际只有 %d 处" % found
+
+
+def test_registry_does_not_hardcode_category_list():
+    """
+    registry.py 的源码里不该再出现完整的分类名列表。
+
+    这条比上面那条更直接：只要有人在 registry 里又写死一遍，它立刻失败。
+    """
+    import pathlib
+
+    registry_path = pathlib.Path(__file__).parent.parent / "tools" / "registry.py"
+    source = registry_path.read_text(encoding="utf-8")
+
+    hardcoded = "体育、科技、财经、娱乐、社会、国内、国际、头条"
+
+    assert hardcoded not in source, (
+        "tools/registry.py 里又硬编码分类列表了，应该用 config 里的 CATEGORY_LIST_TEXT"
+    )
