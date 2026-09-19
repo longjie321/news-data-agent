@@ -74,6 +74,33 @@ async def test_count_by_category_not_exist(db):
     assert result["count"] == 0
 
 
+# ★ 下面两条是补的：category 变成可选之后的行为
+async def test_count_without_category_returns_all(db):
+    """
+    不传分类 → 返回每个分类的篇数 + 总数。
+
+    为什么要有这个能力：用户问"一共有多少条新闻"是最自然的问法，
+    原来没有工具能直接回答，模型只能借 count_news_by_time 硬凑。
+    """
+    result = await count_news_by_category(db)
+
+    assert "by_category" in result
+    assert isinstance(result["by_category"], dict)
+    assert len(result["by_category"]) > 0
+
+    # 总数必须等于各分类之和 —— 不然就是查询逻辑写错了
+    assert result["count"] == sum(result["by_category"].values())
+
+
+async def test_count_all_alias_same_as_without(db):
+    """传"全部"和不传，结果必须完全一样（别名等价）"""
+    without = await count_news_by_category(db)
+    with_alias = await count_news_by_category(db, "全部")
+
+    assert with_alias["count"] == without["count"]
+    assert with_alias["by_category"] == without["by_category"]
+
+
 # ============================================================
 # 工具② search_news
 # ============================================================
