@@ -11,9 +11,10 @@
 
 # 【导包说明】
 #   pydantic —— 【三方库】pip 装的，FastAPI 的数据校验就是靠它
-#     BaseModel ：所有请求/响应模型的基类
-#     Field     ：给字段加约束（必填、长度限制、说明）
-from pydantic import BaseModel, Field
+#     BaseModel       ：所有请求/响应模型的基类
+#     Field           ：给字段加约束（必填、长度限制、说明）
+#     field_validator ：字段级的"自定义校验钩子"（下面第 34 行用了，那里有解释）
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatMessage(BaseModel):
@@ -57,3 +58,27 @@ class AgentChatRequest(BaseModel):
         max_length=20,
         description="历史消息，可以不传（最多 20 条）",
     )
+
+    # ⚠️ 光有 min_length=1 拦不住"纯空格" —— 一个空格的长度也是 1。
+    #   实测：一个空格 / 三个空格 / 换行加空格，全都能通过校验，
+    #   然后真的去调一次大模型（白花钱、还白等几秒）。
+    #   （页面上已经做了 trim 检查，但"直接调接口"这条路径没有 ——
+    #     校验要放在服务端才可靠，前端那道只能算体验优化。）
+    #
+    # 【field_validator 是什么（这个语法第一次出现，解释一下）】
+    #   它是 Pydantic（【三方库】）提供的"字段级校验钩子"：
+    #   字段被赋值之后，这个函数会自动跑一遍。
+    #   里面 raise ValueError 就等价于"校验不通过"，
+    #   FastAPI 会把它变成 422 响应返回给调用方。
+    #   （@classmethod 是 Pydantic 要求的写法，表示这个方法挂在类上而不是实例上）
+    @field_validator("question")
+    @classmethod
+    def question_must_not_be_blank(cls, value: str) -> str:
+        # 先去掉首尾空白，再判断；顺便把"干净的值"返回去，
+        # 这样后面用到的 question 就是修剪过的（不会带着前后空格进提示词）
+        cleaned = value.strip()
+
+        if not cleaned:
+            raise ValueError("问题不能是空白")
+
+        return cleaned
