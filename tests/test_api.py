@@ -214,3 +214,62 @@ def test_force_tool_skipped_for_small_talk():
 def test_plain_chat_question_not_forced():
     """既不是寒暄、也不是查数的普通问题 → 不强制"""
     assert should_force_tool("给我讲个笑话", False, "好的，从前有座山……") is False
+
+
+# ============================================================
+# 流式响应的"最外层兜底"（2026-09-19 排查补上的）
+#
+# 这个测试**不调模型**：它用一个"假装崩溃的 Agent"替换掉真的 run_agent，
+# 所以跑得飞快、也不花钱。
+# ============================================================
+def test_chat_emits_error_event_when_agent_crashes(monkeypatch):
+    """
+    ★ Agent 循环抛出未预期的异常时，接口层必须发一条 error 事件，
+      而不是把连接直接掐断。
+
+    为什么这条值得测：
+      流一旦开始发，HTTP 状态码就改不了了 —— 之后再抛异常，框架只能断连。
+      前端看到的现象是"转圈转到一半突然没了"，既没有 error 也没有 done，
+      用户会以为卡死。这层兜底就是保证"任何意外都至少能变成一条 error 事件"。
+
+    实测背景：run_agent 内部已经把大部分异常转成了事件，但覆盖不全 ——
+      SSE 序列化失败、数据库连接中断、以后新加的代码忘了处理……
+      所以接口层必须有最后一道网。
+    """
+    import routers.agent as router_module
+
+    async def crashing_agent(db, question, history):
+        # 先正常发一条事件：模拟"流已经开始发了"这个前提
+        yield ("tool_call", {"name": "count_news_by_category", "arguments": {}})
+        # 然后抛一个内部没接住的异常
+        raise RuntimeError("模拟一个没人处理的崩溃")
+
+    monkeypatch.setattr(router_module, "run_agent", crashing_agent)
+
+    response = client.post("/api/agent/chat", json={"question": "体育类有多少篇新闻"})
+
+    # 状态码仍然 200（流早开始发了，改不了），但内容里必须有 error 事件
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    # 异常类型要告诉前端（方便定位问题）
+    assert "RuntimeError" in response.text
+
+
+def test_crash_error_message_does_not_leak_internals(monkeypatch):
+    """
+    异常的具体消息**不该**送到浏览器 —— 里面可能带着数据库连接串之类的敏感内容。
+    只把"异常类型"告诉前端，完整信息打在服务端控制台。
+    （这叫"日志给开发看、报错给用户看"）
+    """
+    import routers.agent as router_module
+
+    async def crashing_agent(db, question, history):
+        yield ("tool_call", {"name": "x", "arguments": {}})
+        raise RuntimeError("mysql+aiomysql://root:my-secret-password@127.0.0.1/news")
+
+    monkeypatch.setattr(router_module, "run_agent", crashing_agent)
+
+    response = client.post("/api/agent/chat", json={"question": "测试"})
+
+    assert "my-secret-password" not in response.text
+    assert "aiomysql" not in response.text

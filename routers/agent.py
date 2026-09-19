@@ -91,44 +91,66 @@ async def agent_chat(
         answer = ""
         tool_call_count = 0
 
-        # 第一条事件：把有哪些工具告诉前端（前端可以展示成"可用能力"）
-        yield sse(
-            "mode",
-            {
-                "mode": "agent",
-                "tools": _collect_tool_names(),
-            },
-        )
+        # ⚠️ 这里必须有一层"最外层兜底"（2026-09-19 排查补上的）。
+        #
+        # 【为什么需要】
+        #   流一旦开始发，HTTP 响应头就出去了 —— 之后再抛异常，
+        #   框架没法把状态码改成 500，只能把连接掐断。
+        #   前端看到的现象是：转圈转了半天，没有任何提示就断了，
+        #   既收不到 error、也收不到 done（用户以为"卡死了"）。
+        #
+        #   run_agent 内部已经把大部分异常转成了 error 事件，但不可能全覆盖：
+        #   SSE 序列化失败、数据库连接中断、将来新加的代码忘了处理……
+        #   这层兜底就是保证"任何意外都至少能变成一条 error 事件告诉前端"。
+        try:
+            # 第一条事件：把有哪些工具告诉前端（前端可以展示成"可用能力"）
+            yield sse(
+                "mode",
+                {
+                    "mode": "agent",
+                    "tools": _collect_tool_names(),
+                },
+            )
 
-        # 消费 Agent 循环产生的事件，逐个翻成 SSE 报文
-        async for event_name, payload in run_agent(db, data.question, data.history):
-            if event_name == "tool_call":
-                tool_call_count = tool_call_count + 1
-                yield sse("tool_call", payload)
+            # 消费 Agent 循环产生的事件，逐个翻成 SSE 报文
+            async for event_name, payload in run_agent(db, data.question, data.history):
+                if event_name == "tool_call":
+                    tool_call_count = tool_call_count + 1
+                    yield sse("tool_call", payload)
 
-            elif event_name == "tool_result":
-                yield sse("tool_result", payload)
+                elif event_name == "tool_result":
+                    yield sse("tool_result", payload)
 
-            elif event_name == "answer":
-                piece = payload.get("content") or ""
-                answer = answer + piece
-                yield sse("delta", {"content": piece})
+                elif event_name == "answer":
+                    piece = payload.get("content") or ""
+                    answer = answer + piece
+                    yield sse("delta", {"content": piece})
 
-            elif event_name == "error":
-                yield sse("error", payload)
-                # 出错就直接结束，不再往下发 done（避免前端同时收到 error 和 done）
-                return
+                elif event_name == "error":
+                    yield sse("error", payload)
+                    # 出错就直接结束，不再往下发 done（避免前端同时收到 error 和 done）
+                    return
 
-        # 最后一条事件：回答字数 + 耗时 + 调了几次工具
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        yield sse(
-            "done",
-            {
-                "answer_length": len(answer),
-                "latency_ms": latency_ms,
-                "tool_call_count": tool_call_count,
-            },
-        )
+            # 最后一条事件：回答字数 + 耗时 + 调了几次工具
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            yield sse(
+                "done",
+                {
+                    "answer_length": len(answer),
+                    "latency_ms": latency_ms,
+                    "tool_call_count": tool_call_count,
+                },
+            )
+
+        except Exception as e:
+            # 完整信息打在服务端控制台（方便排查），
+            # 但只把"异常类型"发给前端 —— 因为异常消息里可能带着连接串之类的敏感内容，
+            # 不该往浏览器里送。（这也是"日志给开发看、报错给用户看"的基本分工）
+            print("[event_stream] 未预期的异常：%s: %s" % (type(e).__name__, e))
+            yield sse(
+                "error",
+                {"message": "服务内部错误（%s），请稍后重试" % type(e).__name__},
+            )
 
     return StreamingResponse(
         event_stream(),
