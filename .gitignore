@@ -10,6 +10,11 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# pytest 运行时生成的缓存目录
+# （pytest 自己会在里面放一个 .gitignore 兜着，但显式写出来更清楚，
+#   也避免以后换了工具链被误提交 —— 算双保险）
+.pytest_cache/
+
 # ---- IDE ----
 .idea/
 .vscode/
