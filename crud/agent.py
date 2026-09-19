@@ -34,6 +34,7 @@
 # ============================================================
 
 import json
+import re
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,10 +68,18 @@ MAX_ROUNDS = 8
 # ------------------------------------------------------------
 
 # 数据类关键词：只要问题里出现这些，就说明用户是来查数据的
+#
+# ⚠️ 这里千万不要放"今天 / 最近 / 这周 / 本周"这类泛时间词
+#   实测踩过的坑：`今天天气怎么样？` 里有"今天"，于是被判成数据问题，
+#   模型被强行按回去查库 —— 它随机挑了个工具调（两次跑分别调了
+#   count_news_by_time 和 get_category_trend），回答里还硬塞一句
+#   "顺便说一句，最近一天收录了 207 条新闻，需要我按分类看看吗"。
+#   问天气、答新闻统计，非常奇怪，而且白花一次调用。
+#   所以这里只留"一看就是要查数"的词，泛时间词交给模型自己判断。
 DATA_KEYWORDS = [
     "多少", "几篇", "几条", "几个", "哪些", "排行", "排名", "最高", "最多", "最低",
-    "统计", "搜索", "搜一下", "查一下", "查询", "列表", "最近", "这周", "本周",
-    "今天", "新闻", "浏览量",
+    "统计", "搜索", "搜一下", "查一下", "查询", "列表", "浏览量",
+    "新闻", "头条", "报道",
 ]
 
 # 寒暄类关键词：打招呼、道谢、告别
@@ -78,6 +87,12 @@ SMALL_TALK_KEYWORDS = [
     "你好", "您好", "嗨", "哈喽", "hi", "hello", "谢谢", "多谢", "感谢",
     "再见", "拜拜", "在吗", "你是谁", "介绍一下你", "早上好", "晚上好",
 ]
+
+# "没查库却报出了条数"的特征：数字 + 篇/条
+#
+# 为什么用这个组合：这是"新闻条数"的固定说法，闲聊和拒答里不会出现；
+# 而"我有 7 个工具"这种虽然带数字，但后面跟的不是篇/条，不会误伤。
+FABRICATED_COUNT_PATTERN = re.compile(r"\d+\s*[篇条]")
 
 
 def is_small_talk(question: str) -> bool:
@@ -103,8 +118,46 @@ def is_small_talk(question: str) -> bool:
         if word in text:
             return True
 
-    # 第三步：都不是 —— 当作正常问题处理（保守一点，宁可多查一次）
+    # 第三步：都不是 —— 先当作正常问题，交给下面的兜底逻辑再判断一次
     return False
+
+
+def has_fabricated_count(text: str) -> bool:
+    """
+    判断一段回答里，有没有"没查库却报出来的条数"（比如"共有 51 篇"）。
+
+    这是"模型偷懒"最典型的特征：它不调工具，直接从上下文里猜一个数字说出来。
+    闲聊和"我查不到"这类拒答不会出现"X 篇 / X 条"，所以这个信号很准。
+    """
+    return bool(FABRICATED_COUNT_PATTERN.search(text or ""))
+
+
+def should_force_tool(question: str, chat_only: bool, first_answer: str) -> bool:
+    """
+    第一轮模型没调工具时，判断这到底是"偷懒"还是"本来就不该调"。
+
+    两个信号，命中任意一个才认为它在偷懒：
+      ① 问题里带明确的数据意图词（多少 / 几篇 / 排行 / 浏览量…）
+         —— 用户明摆着是来查数的，不查就是偷懒
+      ② 它的回答里已经报出了"X 篇 / X 条"
+         —— 没查库却说得出条数，那就是编的
+
+    为什么不能简单地"只要不是寒暄就强制"（这是原来的写法，实测有问题）：
+      「今天天气怎么样？」会被泛时间词判成数据问题，模型被强行按回去查库。
+      明明它本来答得挺好（"天气我查不到，建议看天气 App"），
+      结果被逼着随机调一个工具，回答里还混进一段不相关的新闻统计。
+      越界问题应该允许模型直接说"我查不到"，而不是硬塞一次查询。
+    """
+    if chat_only:
+        return False
+
+    text = (question or "").lower()
+
+    for word in DATA_KEYWORDS:
+        if word in text:
+            return True
+
+    return has_fabricated_count(first_answer)
 
 
 def build_initial_messages(question: str, history: list) -> list:
@@ -296,7 +349,14 @@ async def run_agent(db: AsyncSession, question: str, history: list):
         #   这时候它可能真的已经够了、该收尾回答了，再强制就死循环了。
         #
         # 【为什么不干脆每轮都强制】前面已经判断过：强制对寒暄会乱调工具。
-        if round_no == 1 and not chat_only:
+        #
+        # 【怎么判断"这次该不该强制"】交给 should_force_tool 决定 ——
+        #   光看"是不是寒暄"不够：像"今天天气怎么样"这种越界问题，
+        #   既不寒暄、也不是来查数的，原来会被误伤（实测过）。
+        first_answer = message.get("content") or ""
+        force_needed = should_force_tool(question, chat_only, first_answer)
+
+        if round_no == 1 and force_needed:
             if finish_reason != "tool_calls" or not tool_calls:
                 try:
                     choice = await call_llm_once(messages, force_tool=True)
