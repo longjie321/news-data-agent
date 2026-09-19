@@ -398,7 +398,9 @@ function parseSseMessage(raw) {
 //     因为用户可以把恶意内容塞进数据库，模型再照着念出来。）
 //   所以先做转义：把 < > & 换成安全的形式，再动手加样式。
 function escapeHtml(text) {
-    var out = text;
+    // String(...) 兜一层：万一传进来的是 undefined / null / 数字，
+    // 直接 .replace 会报错崩掉整个渲染。先统一转成字符串最稳。
+    var out = String(text === undefined || text === null ? "" : text);
     out = out.replace(/&/g, "&amp;");
     out = out.replace(/</g, "&lt;");
     out = out.replace(/>/g, "&gt;");
@@ -441,8 +443,19 @@ function handleEvent(msg, ui) {
         ui.toolBlock.style.display = "block";
         var line = document.createElement("div");
         line.className = "tool-line";
-        line.innerHTML = "🔧 正在调用 <span class='tool-name'>" + data.name +
-                         "</span>（参数：" + JSON.stringify(data.arguments) + "）";
+
+        // ⚠️ 这里必须转义（2026-09-19 排查出来的）：
+        //    工具名和参数【都来自模型的返回】，不是我们自己写死的常量 ——
+        //    而模型会把用户问题里的词原样当参数传下来。
+        //    所以用户只要在问题里写一段 <img src=x onerror=...>，
+        //    不转义的话这段 HTML 就会被浏览器真的执行（XSS）。
+        //    textContent 天然安全，但这里要保留 <span> 的样式，
+        //    所以用 innerHTML + escapeHtml 处理数据部分。
+        var toolName = data.name || "未知工具";
+        var argText = JSON.stringify(data.arguments || {});
+
+        line.innerHTML = "🔧 正在调用 <span class='tool-name'>" + escapeHtml(toolName) +
+                         "</span>（参数：" + escapeHtml(argText) + "）";
         ui.toolBlock.appendChild(line);
         return;
     }
