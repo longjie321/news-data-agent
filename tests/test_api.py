@@ -110,6 +110,38 @@ def test_chat_rejects_bad_history_role():
     assert response.status_code == 422
 
 
+def test_chat_rejects_too_many_history():
+    """
+    ★ 这条是排查时补的：history 原来【没有条数上限】，
+      实测 5000 条会被原样放行（每条内容还能塞 4000 字）→
+      一个请求就能把体积撑到几十 MB（既烧 token 又可能打爆内存）。
+      现在限制成 20 条，这条测试防止以后被人改回去。
+    """
+    too_many = [{"role": "user", "content": "x"} for _ in range(21)]
+
+    response = client.post(
+        "/api/agent/chat",
+        json={"question": "你好", "history": too_many},
+    )
+
+    assert response.status_code == 422
+
+
+def test_history_limit_allows_20():
+    """
+    20 条以内必须能通过（别把上限卡得太死）。
+    这里直接用 Pydantic 构造、不经过接口 —— 走接口会真的调模型、要花钱。
+    """
+    from schemas.agent import AgentChatRequest
+
+    obj = AgentChatRequest(
+        question="测试",
+        history=[{"role": "user", "content": "x"}] * 20,
+    )
+
+    assert len(obj.history) == 20
+
+
 # ============================================================
 # 接口清单（防止以后改了路由前缀却没人发现）
 # ============================================================
