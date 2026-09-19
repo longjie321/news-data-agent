@@ -52,10 +52,20 @@ PAGE_SIZE = 50
 #   天聚数行要实名认证 + 逐个申请接口，审核得等；
 #   RSS 是公开发布的，立刻能用。两条路都留着，哪条通用哪条。
 #
-# 【为什么 8 个分类只需要 6 个地址】
-#   门户网站（中新网、人民网）**每个频道各有一个 RSS**，
+# 【为什么 8 个分类只需要 7 个地址】
+#   门户网站（中新网）**每个频道各有一个 RSS**，
 #   所以一个站点就能提供好几个分类，不用去找 8 个不同站点。
-#   中新网一个站就覆盖了国内/国际/社会/财经/体育 5 类。
+#
+# ⚠️ 【为什么没用人民网的源（2026-09-18 实测踩到的坑）】
+#   一开始"娱乐"和"头条"用的是人民网的 rss/ent.xml 和 rss/politics.xml。
+#   后来排查数据质量时发现：**这两个源给的是 2025 年 6 月的旧闻**
+#   （73 条挤在 2025-06-05 00:00:00），而项目是 2026 年 9 月 —— 等于一年多没更新。
+#   后果：这两个分类"看起来有数据"，但全是过期内容，
+#        用户问"最近的头条新闻"会答出 2025 年的东西。
+#   → 换成中新网的 scroll-news（滚动新闻）和 culture（文化），实测都是当天更新的。
+#
+#   ★ 教训：**抓完数据一定要看一眼"时间分布"** ——
+#     条数正常不代表数据是对的。同一个时间点挤了几十条，就是源过期的信号。
 #
 # ⚠️ RSS 源可能随时失效（这是公开源的常态）。
 #    运行时某个源挂了，脚本会打印原因并跳过，不影响其他源。
@@ -67,9 +77,9 @@ RSS_SOURCES = {
     "社会": "https://www.chinanews.com.cn/rss/society.xml",
     "财经": "https://www.chinanews.com.cn/rss/finance.xml",
     "体育": "https://www.chinanews.com.cn/rss/sports.xml",
-    "娱乐": "http://www.people.com.cn/rss/ent.xml",
+    "娱乐": "https://www.chinanews.com.cn/rss/culture.xml",
+    "头条": "https://www.chinanews.com.cn/rss/scroll-news.xml",
     "科技": "https://www.ithome.com/rss/",
-    "头条": "http://www.people.com.cn/rss/politics.xml",
 }
 
 # 抓 RSS 时用的浏览器标识。

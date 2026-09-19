@@ -297,6 +297,12 @@ async def main():
     parser.add_argument("--per-feed", type=int, default=30, help="每个源取前几条，默认 30")
     parser.add_argument("--dry-run", action="store_true", help="只打印，不写数据库")
     parser.add_argument(
+        "--max-age-days",
+        type=int,
+        default=90,
+        help="丢掉超过 N 天的旧闻（默认 90 天；写 0 表示不过滤）",
+    )
+    parser.add_argument(
         "--replace",
         action="store_true",
         help="先清空 news 表再灌（把本地测试数据换成真实新闻时用）",
@@ -332,10 +338,60 @@ async def main():
         print("可以先跑 python scripts/seed_data.py 用本地测试数据把项目跑起来。")
         return
 
-    # ---- 打印时间范围，帮忙判断数据新不新 ----
+    # ---- 先丢掉太旧的新闻 ----
+    # 【为什么必须做这一步（2026-09-18 排查数据质量时踩到的坑）】
+    #   有个 RSS 源给的是 2025 年 6 月的旧闻（一年多没更新），
+    #   但它照样返回 50 条"看起来完全正常"的数据。
+    #   不做时间过滤的话，库里就混进一批过期新闻 ——
+    #   用户问"最近的头条新闻"，会答出 2025 年的东西。
+    #   ★ 条数正常 ≠ 数据是对的。
+    if args.max_age_days > 0:
+        cutoff = datetime.now() - timedelta(days=args.max_age_days)
+        before_count = len(all_items)
+
+        fresh_items = []
+        for item in all_items:
+            if item["publish_time"] >= cutoff:
+                fresh_items.append(item)
+
+        dropped = before_count - len(fresh_items)
+        all_items = fresh_items
+
+        if dropped > 0:
+            print("  [时间过滤] 丢掉 %d 条超过 %d 天的旧闻" % (dropped, args.max_age_days))
+
+    if not all_items:
+        print("")
+        print("  按 %d 天过滤后一条都不剩了。" % args.max_age_days)
+        print("  说明这些源都很久没更新 —— 换个源，或者用 --max-age-days 0 关掉过滤。")
+        return
+
+    # ---- 打印时间范围 + 新鲜度检查 ----
+    # 【这段是这次排查问题后加的】光看"抓到多少条"发现不了源过期，
+    #   必须专门看一眼时间分布。
     times = [item["publish_time"] for item in all_items]
-    print("  最早一条：%s" % min(times).strftime("%Y-%m-%d"))
-    print("  最新一条：%s" % max(times).strftime("%Y-%m-%d"))
+    newest = max(times)
+    oldest = min(times)
+    age_days = (datetime.now() - newest).days
+
+    print("  最早一条：%s" % oldest.strftime("%Y-%m-%d"))
+    print("  最新一条：%s（%d 天前）" % (newest.strftime("%Y-%m-%d"), age_days))
+
+    if age_days > 7:
+        print("")
+        print("  ⚠️  警告：最新的新闻都已经是 %d 天前的了，这些源很可能停更了！" % age_days)
+        print("      条数正常不代表数据是对的 —— 建议换源（见 config/news_conf.py 的说明）")
+
+    # 再看有没有"一堆新闻挤在同一秒"——那是源过期或时间解析失败的典型痕迹
+    from collections import Counter
+
+    same_moment = Counter(t.strftime("%Y-%m-%d %H:%M:%S") for t in times)
+    top_moment, top_count = same_moment.most_common(1)[0]
+
+    if top_count >= 10:
+        print("")
+        print("  ⚠️  警告：有 %d 条新闻的时间完全相同（%s）——" % (top_count, top_moment))
+        print("      正常新闻不会挤在同一秒，这通常说明该源的数据有问题。")
 
     # ---- dry-run：只看不存 ----
     if args.dry_run:
