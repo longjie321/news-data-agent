@@ -353,10 +353,16 @@ async def run_agent(db: AsyncSession, question: str, history: list):
         # 【怎么判断"这次该不该强制"】交给 should_force_tool 决定 ——
         #   光看"是不是寒暄"不够：像"今天天气怎么样"这种越界问题，
         #   既不寒暄、也不是来查数的，原来会被误伤（实测过）。
-        first_answer = message.get("content") or ""
-        force_needed = should_force_tool(question, chat_only, first_answer)
+        # 只在第一轮做这个判断 —— 所以放进 if 里面，
+        # 后面几轮（2~8）就不用白算一遍了（开销很小，但意图也更清楚：
+        # 这个兜底只跟第一轮有关）。
+        force_needed = False
 
-        if round_no == 1 and force_needed:
+        if round_no == 1:
+            first_answer = message.get("content") or ""
+            force_needed = should_force_tool(question, chat_only, first_answer)
+
+        if force_needed:
             if finish_reason != "tool_calls" or not tool_calls:
                 try:
                     choice = await call_llm_once(messages, force_tool=True)
