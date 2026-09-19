@@ -107,12 +107,44 @@ def _news_to_dict(row: News) -> dict:
     }
 
 
-async def count_news_by_category(db: AsyncSession, category: str) -> dict:
-    """
-    工具① 统计某个分类下有多少篇新闻。
+# 传了下面这几个值，等同于"不分类、全都要"
+ALL_CATEGORY_ALIASES = ("全部", "所有", "全部分类", "all", "total", "全部新闻")
 
-    对应问法："体育类有多少篇新闻" / "科技类新闻多不多"
+
+async def count_news_by_category(db: AsyncSession, category: str = None) -> dict:
     """
+    工具① 统计新闻数量。
+
+    不传 category（或传"全部""所有"）：
+        返回每个分类各自的篇数 + 总数，一次拿全。
+    传 category：
+        只统计这一个分类。
+
+    对应问法："体育类有多少篇新闻" / "一共有多少条新闻" / "哪几类各有多少篇"
+    """
+    # ---------- 分支一：不指定分类 → 一次把所有分类都统计出来 ----------
+    #
+    # 【为什么要加这个分支 —— 这是实测发现的问题】
+    #   原来 category 是必填的，于是用户问最自然的"库里一共有多少条新闻"时，
+    #   模型**没有工具能直接回答**，只能硬凑：
+    #   实测它去调了 count_news_by_time(days=365)，答成"最近一年共有 239 条"。
+    #   数字碰巧对了，但如果库里有超过一年的数据，这个答案就是错的。
+    #   另外问"哪几类各有多少篇"时，它连调了 8 次同一个工具才凑齐 ——
+    #   现在一次调用就够了（更少的轮次、更少的 token、更快）。
+    if not category or str(category).strip() in ALL_CATEGORY_ALIASES:
+        # group_by 相当于 SQL 的 GROUP BY category
+        # 返回的是 [(分类名, 篇数), ...] 这种一行一行的结构
+        stmt = select(News.category, func.count()).group_by(News.category)
+        rows = (await db.execute(stmt)).all()
+
+        by_category = {name: count for name, count in rows}
+
+        return {
+            "count": sum(by_category.values()),
+            "by_category": by_category,
+        }
+
+    # ---------- 分支二：指定了分类 → 只数这一个 ----------
     # select(func.count()) 相当于 SQL 的 SELECT COUNT(*)
     # select_from(News) 说明"从 news 这张表里数"
     # where(...) 就是 WHERE 条件
