@@ -31,6 +31,10 @@ import json
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# 分类清单文本（"体育、科技、财经…"）从 config 那边取，
+# 保证"工具描述里给模型看的可选值"和代码里其他地方永远一致 ——
+# 以前这串字在下面写了两遍，改分类时很容易漏。
+from config.news_conf import CATEGORY_LIST_TEXT
 from tools.definitions import (
     compare_categories,
     count_news_by_category,
@@ -74,7 +78,7 @@ TOOLS = [
                         "type": "string",
                         "description": (
                             "新闻分类名，必须是这八个之一："
-                            "体育、科技、财经、娱乐、社会、国内、国际、头条。"
+                            f"{CATEGORY_LIST_TEXT}。"
                             "如果用户问的是总数、或者要所有分类的分布，这个参数不要传。"
                         ),
                     },
@@ -155,7 +159,7 @@ TOOLS = [
                         "description": (
                             "可选。只想统计某一个分类时填，比如“科技”。"
                             "不填就表示统计所有分类。"
-                            "可选值：体育、科技、财经、娱乐、社会、国内、国际、头条"
+                            f"可选值：{CATEGORY_LIST_TEXT}"
                         ),
                     },
                 },
@@ -203,7 +207,7 @@ TOOLS = [
                 "properties": {
                     "category_a": {
                         "type": "string",
-                        "description": "第一个分类名，可选值：体育、科技、财经、娱乐、社会、国内、国际、头条",
+                        "description": f"第一个分类名，可选值：{CATEGORY_LIST_TEXT}",
                     },
                     "category_b": {
                         "type": "string",
@@ -267,7 +271,7 @@ TOOL_NAME_TO_FUNCTION = {
 # 工具结果的长度保护
 #
 # 【为什么需要】
-#   Agent 循环最多跑 5 轮（MAX_ROUNDS），每一轮的工具结果都会被累加进
+#   Agent 循环最多跑 8 轮（MAX_ROUNDS，见 crud/agent.py），每一轮的工具结果都会被累加进
 #   messages 里、再发给模型。而 search_news 一次最多能返回 20 条新闻 ——
 #   几轮下来上下文会明显膨胀：既费钱（按 token 计费），也可能撑爆模型的上下文窗口。
 #
@@ -276,6 +280,20 @@ TOOL_NAME_TO_FUNCTION = {
 #     写一处就能全都覆盖，以后加新工具也自动生效。）
 # ------------------------------------------------------------
 MAX_RESULT_CHARS = 6000
+
+# ★ 这几个字段截断时要保留"尾部"而不是"头部"（2026-09-19 实测发现的问题）
+#
+# 为什么：同样是"一串按顺序排的数据"，保留哪一头完全相反 ——
+#   news   新闻列表：按发布时间【倒序】排，最新的在前 → 保留头部（前几条）
+#   series 时间序列：按日期【正序】排，最早的在前面 → 必须保留尾部（最近几天）
+#
+# 原来一律保留前半段，于是实测出一个隐蔽的 bug：
+#   问"最近一年发文走势"，get_category_trend(days=365) 返回 365 天，
+#   长度超标被砍到 91 项 —— 模型拿到的是【最早那 91 天】，
+#   最近三个多月的数据直接消失了。它据此判趋势，结论会完全反过来，
+#   而且它自己完全不知道（因为 note 只说"截断了"）。
+#   时间序列的价值恰恰在"最近"，所以 series 必须从尾部保留。
+TAIL_KEEP_KEYS = ("series",)
 
 
 def _json_length(data) -> int:
@@ -303,9 +321,13 @@ def _limit_result_size(result: dict) -> dict:
         if not isinstance(items, list):
             continue
 
+        # 时间序列从头砍会丢掉"最新"，所以对它反过来保留尾部（见上面 TAIL_KEEP_KEYS）
+        keep_tail = key in TAIL_KEEP_KEYS
+
         while len(items) > 1:
             # 每次砍掉一半，直到长度达标
-            items = items[: len(items) // 2]
+            half = len(items) // 2
+            items = items[-half:] if keep_tail else items[:half]
             trimmed[key] = items
 
             if _json_length(trimmed) <= MAX_RESULT_CHARS:
@@ -314,7 +336,12 @@ def _limit_result_size(result: dict) -> dict:
                 #   否则模型看到 3 条数据，会以为"库里总共就 3 条"，
                 #   答出"全文只有 3 篇"这种错误结论。
                 trimmed["kept"] = len(items)
-                trimmed["note"] = "结果过长已截断，只保留了前 %d 条" % len(items)
+                if keep_tail:
+                    trimmed["note"] = (
+                        "结果过长已截断，只保留了最近 %d 天" % len(items)
+                    )
+                else:
+                    trimmed["note"] = "结果过长已截断，只保留了前 %d 条" % len(items)
                 return trimmed
 
     # 列表砍到只剩一条还是太长（比如单条正文特别长）→ 整体只给一段预览

@@ -34,6 +34,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from config.db_conf import DB_URL
+from config.news_conf import CATEGORIES
 from models.news import News
 
 # 随机种子：固定一个数，保证每次都生成同样的数据（出问题时好复现）
@@ -42,7 +43,8 @@ RANDOM_SEED = 20260918
 # 每个分类灌多少条
 PER_CATEGORY = 50
 
-CATEGORIES = ["体育", "科技", "财经", "娱乐", "社会", "国内", "国际", "头条"]
+# ⚠️ 分类清单从 config/news_conf.py 取（那里是整个项目唯一的定义处）。
+#    以前这个脚本里也写了一份，加分类的时候很容易和工具描述对不上。
 
 # 分类 → 标题模板
 TITLE_TEMPLATES = {
