@@ -1,6 +1,6 @@
 # ============================================================
 # 【这个文件干什么】
-#   测试 7 个工具函数能不能正常工作（只测数据库这一层，不调用大模型）。
+#   测试 8 个工具函数能不能正常工作（只测数据库这一层，不调用大模型）。
 #
 # 【怎么跑】
 #   在项目根目录执行：
@@ -32,10 +32,12 @@ from tools.definitions import (
     _clean_days,
     _clean_limit,
     _since_datetime,
+    _to_bool,
     compare_categories,
     count_news_by_category,
     count_news_by_time,
     get_category_trend,
+    get_longest_news,
     get_news_detail,
     get_top_news,
     search_news,
@@ -210,6 +212,55 @@ async def test_news_detail_content_is_trimmed(db):
     assert len(detail["content"]) <= 300
     assert detail["content_length"] >= len(detail["content"])
 
+    # 还要如实告诉模型"这段正文是不是被砍过"——
+    # 否则它会把 300 字当成全文，回答时说"这篇文章讲了…"却漏了后半段
+    if detail["content_length"] > 300:
+        assert detail["content_truncated"] is True
+    else:
+        assert detail["content_truncated"] is False
+
+
+async def test_news_detail_full_returns_whole_content(db):
+    """
+    full=True 时必须给完整正文，一个字符都不能少。
+
+    ★ 这条是给一个真实用户问题加的保险（2026-09-20）：
+      用户说"把所有新闻里面最长的一篇完整发给我"，
+      而原来的工具无论如何只给 300 字 —— "完整"这个要求永远满足不了。
+    """
+    # 用新工具⑧拿到正文最长那篇的 id（顺带也测了它的返回结构）
+    longest = await get_longest_news(db, limit=1)
+    assert longest["count"] > 0
+
+    item = longest["news"][0]
+    detail = await get_news_detail(db, item["id"], full=True)
+
+    assert detail["content_truncated"] is False
+    # 完整正文的字符数，必须和 content_length 完全对得上
+    assert len(detail["content"]) == detail["content_length"]
+    # 口径要和工具⑧一致（都是按【字符】数，不是字节数）
+    assert detail["content_length"] == item["content_length"]
+
+
+async def test_news_detail_full_accepts_dirty_bool(db):
+    """
+    full 传脏值（字符串 "false" / "0"）不能被当成"要完整正文"。
+
+    ★ Python 里【非空字符串一律为真】，所以 "false" 会被判成 True ——
+      这是个特别隐蔽的坑：用户明明说不用完整正文，代码却把上千字全塞进上下文。
+      _to_bool 就是专门治它的。
+    """
+    top = await get_top_news(db, limit=1)
+    news_id = top["news"][0]["id"]
+
+    # "false" 要按 False 处理 → 仍然是预览版
+    detail_false = await get_news_detail(db, news_id, full="false")
+    assert len(detail_false["content"]) <= 300
+
+    # "0" 同理
+    detail_zero = await get_news_detail(db, news_id, full="0")
+    assert len(detail_zero["content"]) <= 300
+
 
 async def test_news_detail_not_found(db):
     """查不到时不抛异常，而是返回 error 交给模型自己处理"""
@@ -273,6 +324,74 @@ async def test_category_trend_is_continuous_and_sorted(db):
 
 
 # ============================================================
+# 工具⑧ get_longest_news（2026-09-20 加的）
+# ============================================================
+async def test_longest_news_is_sorted(db):
+    """
+    ★ 必须真的按【正文长度】从长到短排 ——
+      这个顺序错了，模型就会把一篇普通的新闻说成"最长的一篇"。
+    """
+    result = await get_longest_news(db, limit=5)
+
+    assert result["count"] > 0
+
+    lengths = [item["content_length"] for item in result["news"]]
+    assert lengths == sorted(lengths, reverse=True), "没有按正文长度倒序排！"
+
+    for item in result["news"]:
+        assert "id" in item
+        assert "content_length" in item
+
+
+async def test_longest_news_length_matches_real_content(db):
+    """
+    报出来的 content_length 必须等于正文的真实【字符】数。
+
+    ★ 为什么专门测这个：
+      如果 SQL 那边误用了 LENGTH()（字节数）而不是 CHAR_LENGTH()（字符数），
+      一个汉字会被算成 3 —— 排序结果碰巧还是对的，但报给模型的数字会大 3 倍，
+      它一开口就说错（把一篇 500 字的新闻说成"1500 字"）。
+    """
+    result = await get_longest_news(db, limit=3)
+
+    for item in result["news"]:
+        # 用 id 把这条新闻取回来，亲自数一遍真实字符数
+        detail = await get_news_detail(db, item["id"], full=True)
+        real_length = len(detail["content"])
+
+        assert item["content_length"] == real_length, (
+            "工具报的长度和真实正文对不上：报 %d、实际 %d（是不是用了字节数？）"
+            % (item["content_length"], real_length)
+        )
+
+
+async def test_longest_news_limit_is_clamped(db):
+    """模型瞎填 limit（9999）要被兜住"""
+    result = await get_longest_news(db, limit=9999)
+
+    assert result["count"] <= MAX_LIMIT
+
+
+async def test_longest_news_two_hop(db):
+    """
+    ★ 完整复现用户那个真实提问："最长的一篇完整发给我"
+
+      正确的两步是：⑧ 拿到最长那篇的 id → ⑤ 传 full=True 拿完整正文。
+      改之前这条链是断的：没有⑧（模型只能去调按浏览量排的工具，然后说做不到），
+      而且⑤无论如何只给 300 字（"完整"这个要求永远满足不了）。
+    """
+    longest = await get_longest_news(db, limit=1)
+    assert longest["count"] > 0
+
+    news_id = longest["news"][0]["id"]
+    detail = await get_news_detail(db, news_id, full=True)
+
+    assert detail["id"] == news_id
+    assert detail["content_truncated"] is False
+    assert len(detail["content"]) == detail["content_length"]
+
+
+# ============================================================
 # 工具注册表的一致性（最容易出错、也最该测的地方）
 # ============================================================
 def test_schema_matches_function_table():
@@ -298,7 +417,8 @@ def test_schema_matches_function_table():
 
 def test_tool_count():
     """工具数量对不上通常意味着加漏了或删漏了"""
-    assert len(TOOLS) == 7
+    # 2026-09-20：从 7 加到 8（新增 get_longest_news，按正文长度排序）
+    assert len(TOOLS) == 8
 
 
 def test_every_tool_has_description():
@@ -382,6 +502,53 @@ def test_clean_days_clamps_range():
     assert _clean_days(0) == 1
     assert _clean_days(-1) == 1
     assert _clean_days(999) == 365
+
+
+# ============================================================
+# _to_bool：布尔参数也要洗（2026-09-20 加）
+# ============================================================
+def test_to_bool_handles_real_bool():
+    """本来就是布尔 → 原样返回"""
+    assert _to_bool(True) is True
+    assert _to_bool(False) is False
+
+
+def test_to_bool_treats_string_false_as_false():
+    """
+    ★ 这条是整个函数存在的理由：
+      Python 里【非空字符串一律为真】，所以 "false" 会被判成 True。
+      不洗的话，用户说"不用完整正文"，代码却把上千字全塞进上下文（费钱、还可能撑爆）。
+    """
+    assert _to_bool("false") is False
+    assert _to_bool("False") is False
+    assert _to_bool("FALSE") is False
+    assert _to_bool("0") is False
+    assert _to_bool("no") is False
+    assert _to_bool("否") is False
+
+
+def test_to_bool_accepts_true_like_values():
+    assert _to_bool("true") is True
+    assert _to_bool("True") is True
+    assert _to_bool("1") is True
+    assert _to_bool("yes") is True
+    assert _to_bool("是") is True
+    assert _to_bool(1) is True
+
+
+def test_to_bool_falls_back_to_default():
+    """认不出来的（None / 乱写的字符串）→ 用默认值，不能崩、也不能想当然"""
+    assert _to_bool(None) is False
+    assert _to_bool("随便写点什么") is False
+    # 默认值是可配的：换一个场景（默认要）时，认不出来就该回落到 True
+    assert _to_bool("随便写点什么", default=True) is True
+    assert _to_bool(None, default=True) is True
+
+
+def test_to_bool_zero_is_false():
+    """数字 0 / 0.0 算假"""
+    assert _to_bool(0) is False
+    assert _to_bool(0.0) is False
 
 
 # ============================================================
