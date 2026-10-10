@@ -75,6 +75,44 @@ def _to_int(value, default: int) -> int:
         return default
 
 
+def _to_bool(value, default: bool = False) -> bool:
+    """
+    把模型给的参数挤成布尔值（跟 _to_int 是同一套思路，2026-09-20 加）。
+
+    ★ 为什么不能直接写 `if value`
+      模型的参数走 JSON，理论上布尔就是布尔。但实测它会写成字符串：
+        "true" / "false" / "1" / "0"
+      而 Python 有一条规则：【非空字符串一律为真】——
+      也就是说 "false" 会被判成 True！
+      后果特别隐蔽：用户说"不用完整正文"，代码却当成"要完整正文"，
+      把上千字的正文全塞进上下文（费钱，还可能撑爆）。
+      所以统一先转一道，和 _to_int 一个道理：模型给的脏数据，用之前先洗干净。
+    """
+    # 本来就是布尔，直接用
+    if isinstance(value, bool):
+        return value
+
+    # 字符串形式：明确认一下"是"和"否"这两组写法
+    if isinstance(value, str):
+        text = value.strip().lower()
+
+        if text in ("true", "1", "yes", "y", "是", "要", "需要"):
+            return True
+
+        if text in ("false", "0", "no", "n", "否", "不要", "不需要"):
+            return False
+
+        # 认不出来的字符串 → 交给默认值（不是想当然地当 False）
+        return default
+
+    # 数字形式：非 0 即为真（0 和 0.0 都算假）
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    # 其他一律当没给，用默认值
+    return default
+
+
 def _clean_limit(limit: int) -> int:
     """
     把模型给的 limit 修正到一个合理范围内。
@@ -343,20 +381,32 @@ async def count_news_by_time(
     }
 
 
-async def get_news_detail(db: AsyncSession, news_id: int) -> dict:
+async def get_news_detail(
+    db: AsyncSession,
+    news_id: int,
+    full: bool = False,
+) -> dict:
     """
     工具⑤ 按编号查一篇新闻的详细信息（含正文）。
 
     对应问法："搜出来的第二篇讲了什么" / "把浏览量最高那篇的内容说一下"
+              / "把最长的那篇完整发给我"（这种要把 full 传 true）
 
     ★ 这个工具存在的意义，是让"多跳"成为可能：
       用户很难直接说出新闻编号，所以正确的用法是
-      「先调 ② search_news 或 ③ get_top_news 拿到 id，再用本工具查内容」。
+      「先调 ② search_news / ③ get_top_news / ⑧ get_longest_news 拿到 id，
+        再用本工具查内容」。
       单靠它自己，什么问题都答不了 —— 这正是它价值所在（逼模型拆步骤）。
 
-    ⚠️ 正文只返回前 300 字：
+    ⚠️ 正文默认只返回前 300 字：
       一篇新闻正文可能上千字，整个塞给模型会浪费上下文和钱，
       而 300 字足够它回答"讲了什么"。
+      只有用户明确要"完整正文 / 全文"时才传 full=true（见下面）。
+
+    【full 参数是 2026-09-20 加的，来自一个真实答不出来的问题】
+      用户问"把所有新闻里面最长的一篇完整发给我"，
+      而当时这个工具只给 300 字 —— 就算模型找到了那篇，也给不出"完整"的正文。
+      「用户要完整」和「代码只给前 300 字」之间的矛盾，得靠一个参数解开。
     """
     stmt = select(News).where(News.id == news_id)
 
@@ -372,8 +422,21 @@ async def get_news_detail(db: AsyncSession, news_id: int) -> dict:
 
     detail = _news_to_dict(row)
     detail["author"] = row.author
-    detail["content"] = content[:300]
     detail["content_length"] = len(content)
+
+    # full 也要洗一道：模型可能把布尔值写成字符串 "false"，
+    # 而 "false" 在 Python 里是【真】—— 不洗的话会被误判成"要完整正文"。
+    if _to_bool(full):
+        # 用户明确要完整正文 → 不截断。
+        # ⚠️ 这里不加长度判断也不会出事：registry.py 的 _limit_result_size 会兜底
+        #    （超长就砍短、并打上 truncated 标记告诉模型），所以撑不爆上下文。
+        detail["content"] = content
+        detail["content_truncated"] = False
+    else:
+        detail["content"] = content[:300]
+        # 明确告诉模型"这段正文是不是被砍过" ——
+        # 否则它会把 300 字当成全文，回答时说"这篇文章主要讲了…"却漏掉后半段
+        detail["content_truncated"] = len(content) > 300
 
     return detail
 
@@ -520,6 +583,62 @@ async def get_category_trend(
     }
 
 
+async def get_longest_news(db: AsyncSession, limit: int = 5) -> dict:
+    """
+    工具⑧ 按【正文长度】从长到短取前几篇新闻。
+
+    对应问法："哪篇新闻的正文最长" / "内容最多的是哪一篇"
+              / "把最长的那篇完整发给我"（拿到 id 后再调 ⑤ 并传 full=true）
+
+    ★ 为什么要加这个工具（2026-09-20，来自一个真实的"答非所问"案例）
+
+      用户问："你把所有新闻里面最长的一篇完整发给我"
+      而当时只有 ③ get_top_news（按【浏览量】排）——
+      模型手上没有别的牌，就硬着头皮调了它，然后如实说
+      "排行榜里不返回正文长度，我做不到"，最后反过来问用户"你想用哪种方式？"
+
+      问题不在模型笨，而在【它手上没有这把牌】：
+      "最长"和"最热"是两个完全不同的字段（正文字数 vs 浏览量）。
+      工具集缺一个维度，模型就会拿一个看起来相近的工具凑数 ——
+      用户看到的就是"答非所问"，而且它给出的答案常常还挺像回事。
+
+      这条经验值得记在面试里：
+        **工具集覆盖不到的问法，模型不会说"我不会"，而是会编一个近似答案。**
+        所以要按"用户真实会怎么问"来设计工具，而不是按"数据库有哪些字段"。
+    """
+    limit = _clean_limit(limit)
+
+    # func.char_length(...) 对应 MySQL 的 CHAR_LENGTH()：按【字符】数算长度。
+    #   ⚠️ 不要用 func.length()：那个算的是【字节】数，一个汉字占 3 字节，
+    #      算出来的"长度"是字数的三倍。虽然排序结果一样，
+    #      但返回给模型的 content_length 会是个吓人的数字，它说出来就不对了。
+    #   coalesce(...) 是"正文为 NULL 时当成空字符串"，避免 NULL 参与排序时
+    #      跑到最前面（MySQL 里 NULL 在 DESC 排序中最小，但行为容易让人误解）。
+    length_column = func.char_length(func.coalesce(News.content, ""))
+
+    stmt = (
+        select(News)
+        .order_by(length_column.desc())
+        .limit(limit)
+    )
+
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    news_list = []
+    for row in rows:
+        item = _news_to_dict(row)
+        # 把正文长度一并返回 —— 模型回答"最长的是 XXX，共 1501 字"时要用这个数。
+        # 注意这里用 len(...) 算的是 Python 层面的字符数，和上面 CHAR_LENGTH 口径一致。
+        item["content_length"] = len(row.content or "")
+        news_list.append(item)
+
+    return {
+        "count": len(news_list),
+        "news": news_list,
+    }
+
+
 # ------------------------------------------------------------
 # 所有工具函数的清单
 # registry.py 会遍历这个列表，把每个函数登记成"模型可以调用的工具"。
@@ -533,4 +652,5 @@ ALL_TOOL_FUNCTIONS = [
     get_news_detail,
     compare_categories,
     get_category_trend,
+    get_longest_news,
 ]

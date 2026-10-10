@@ -1,6 +1,6 @@
 # ============================================================
 # 【这个文件干什么】
-#   把 definitions.py 里那 7 个函数，"登记"成模型能看懂的工具。
+#   把 definitions.py 里那 8 个函数，"登记"成模型能看懂的工具。
 #
 #   每个工具要登记三样：
 #     ① name         工具名（模型要调用时说这个名字）
@@ -16,11 +16,17 @@
 #   （面试聊到"提示词工程"，这就是一个具体可讲的例子）
 #
 # 【写 description 的一条经验（针对工具有重叠的情况）】
-#   加厚到 7 个工具之后，出现了"功能相近"的工具，比如：
+#   工具加到 7 个之后，出现了"功能相近"的工具，比如：
 #     ④ count_news_by_time（只给一个总数）  vs  ⑦ get_category_trend（给每天的序列）
 #     ① count_news_by_category（一个分类）    vs  ⑥ compare_categories（对比两个分类）
 #   这种时候要在 description 里明确写"什么时候**不要**用我"，
 #   否则模型容易挑一个近似的糊过去。下面 ⑥⑦ 都加了这样的提示。
+#
+#   ★ 2026-09-20 又加了一对，而且这一对是"答非所问"的典型来源：
+#     ③ get_top_news（按【浏览量】排）  vs  ⑧ get_longest_news（按【正文长度】排）
+#   实测的真实案例：用户问"最长的一篇"，模型却调了③（按浏览量排），
+#   然后只能说"排行榜不返回正文长度，我做不到"。
+#   加上⑧之后，两个工具的 description 里都写明了彼此的区分标准（"最热" vs "最长"）。
 #
 # 【注意】
 #   parameters 的结构是模型那边的接口规范（JSON Schema），
@@ -40,6 +46,7 @@ from tools.definitions import (
     count_news_by_category,
     count_news_by_time,
     get_category_trend,
+    get_longest_news,
     get_news_detail,
     get_top_news,
     search_news,
@@ -128,8 +135,11 @@ TOOLS = [
         "function": {
             "name": "get_top_news",
             "description": (
-                "按浏览量从高到低取前几篇新闻，也就是排行榜（每条都带 id）。"
+                "按【浏览量】从高到低取前几篇新闻，也就是热门排行榜（每条都带 id）。"
                 "当用户问“哪篇最热门”“浏览量最高的是哪篇”时使用。"
+                "⚠️ 本工具只按浏览量排。如果用户问的是“最长 / 内容最多 / 字数最多”，"
+                "要用 get_longest_news，不要用本工具 —— 两者排序依据完全不同，"
+                "用错了会答非所问。"
                 "如果用户还要看某一篇的具体内容，再调用 get_news_detail。"
             ),
             "parameters": {
@@ -183,9 +193,12 @@ TOOLS = [
         "function": {
             "name": "get_news_detail",
             "description": (
-                "按新闻编号查它的详细内容（标题、分类、浏览量、来源、正文前 300 字）。"
-                "当用户问“刚才搜到的那篇讲了什么”“最热门那篇的内容是什么”时使用。"
-                "⚠️ 编号不能凭空编，必须先调用 search_news 或 get_top_news 拿到 id，再调本工具。"
+                "按新闻编号查它的详细内容（标题、分类、浏览量、来源、正文）。"
+                "当用户问“刚才搜到的那篇讲了什么”“最热门那篇的内容是什么”时使用。\n"
+                "⚠️ 编号不能凭空编，必须先调用 search_news、get_top_news 或 get_longest_news "
+                "拿到 id，再调本工具。\n"
+                "⚠️ 默认只返回正文前 300 字（回答“讲了什么”够用了）。"
+                "只有用户明确要“完整正文 / 全文 / 一字不落地发给我”时，才把 full 传成 true。"
             ),
             "parameters": {
                 "type": "object",
@@ -193,8 +206,15 @@ TOOLS = [
                     "news_id": {
                         "type": "integer",
                         "description": (
-                            "新闻编号，必须来自 search_news 或 get_top_news 返回结果里的 id 字段，"
-                            "不要自己猜一个数字"
+                            "新闻编号，必须来自 search_news、get_top_news 或 get_longest_news "
+                            "返回结果里的 id 字段，不要自己猜一个数字"
+                        ),
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "description": (
+                            "是否返回完整正文。默认 false（只给前 300 字）。"
+                            "只有用户明确要求完整正文时才传 true。"
                         ),
                     },
                 },
@@ -258,6 +278,33 @@ TOOLS = [
             },
         },
     },
+    # ========== 第三批：按"最容易答非所问"的问法补的（2026-09-20） ==========
+    {
+        "type": "function",
+        "function": {
+            "name": "get_longest_news",
+            "description": (
+                "按【正文长度】从长到短取前几篇新闻（每条都带 id 和 content_length）。"
+                "当用户问“正文最长的是哪篇”“内容最多、字数最多的是哪一篇”"
+                "“哪篇写得最长”时使用。\n"
+                "⚠️ 和 get_top_news 的区别（这两个很容易搞混，一搞混就是答非所问）："
+                "问“最热 / 浏览量最高”用 get_top_news（按浏览量排）；"
+                "问“最长 / 内容最多 / 字数最多”用本工具（按正文字数排）。\n"
+                "如果用户还要看那一篇的完整正文，先调用本工具拿到 id，"
+                "再调 get_news_detail 并把 full 传成 true。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "取前几名，默认 5，最多 20",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -275,6 +322,7 @@ TOOL_NAME_TO_FUNCTION = {
     "get_news_detail": get_news_detail,
     "compare_categories": compare_categories,
     "get_category_trend": get_category_trend,
+    "get_longest_news": get_longest_news,
 }
 
 
