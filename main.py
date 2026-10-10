@@ -35,7 +35,7 @@ from routers import agent
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="新闻数据智能体",
+    title="新闻数据分析智能体（LLM Agent）",
     description="用自然语言查询新闻数据的 AI Agent 服务（DeepSeek Function Calling）",
     version="1.0.0",
 )
