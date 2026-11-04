@@ -1,20 +1,5 @@
-# ============================================================
-# 【这个文件干什么】
-#   建数据库 + 建表。项目第一次跑的时候执行一次就行。
-#
-# 【用法】
-#   python scripts/init_db.py            建库建表（已经有了就跳过，不会删数据）
-#   python scripts/init_db.py --reset    先删表再重建（会清空数据）
-#
-# 【注意】
-#   ① 只操作 news_agent 这个库，完全不碰项目1 的 news_app。
-#   ② 数据不在这里灌。灌数据是另外两个脚本的事：
-#        scripts/seed_data.py    本地生成的测试数据（不需要联网）
-#        scripts/fetch_news.py   从天聚数行抓真实新闻（需要联网 + 已申请接口）
-#   ③ 脚本开头要往 sys.path 里加项目根目录，
-#      否则直接跑 scripts/xxx.py 时 Python 找不到 config、models 这些包。
-#      （项目1 的 scripts/ingest_news.py 里也有同样一句）
-# ============================================================
+# 建数据库 + 建表。项目第一次跑的时候执行一次就行。
+# python scripts/init_db.py            建库建表（已经有了就跳过，不会删数据）
 
 import argparse
 import asyncio
